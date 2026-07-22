@@ -75,14 +75,17 @@ Core business entities modeling the study loop, from raw frequency data down to 
 Key decision: **Rich Model over Anemic Model**. `Card` owns its own SM-2 state (`ease_factor`, `interval_days`, `repetitions`, `next_review_at`) and exposes the `is_due` business rule directly. The `SrsService` is the only thing that mutates this state, and it does so *through* the card object, not around it.
 
 Current entities:
-* `Language` — ISO 639-1 code, name, whether a frequency list exists for it (used to decide whether automatic deck generation is possible, once that lands)
+* `Language` — ISO 639-1 code, name, whether a frequency list exists for it
 * `Card` — front/back pair, owns its live SM-2 scheduling state
-* `Deck` — a named collection of cards; `MANUAL` (hand-curated) or `FREQUENCY` (reserved for the auto-generated decks landing in Sprint 2 — not yet populated by anything in this sprint)
+* `Deck` — a named collection of cards; `MANUAL` (hand-curated) or `FREQUENCY` (auto-generated from a rank range)
 * `ReviewLog` — immutable history of every review (quality, intervals before/after, ease factor after, reaction time). Kept separate from `Card`'s live state deliberately: SM-2 only needs the card's current state, but a future migration to **FSRS** needs the full history — so that data is captured from day one even though SM-2 doesn't use it yet
+* `FrequencyProgress` — tracks the last frequency rank already turned into a deck, per language, so deck generation always knows where to continue
 
 ### Repository Layer
 
-Each repository converts between domain models and SQLAlchemy ORM models (`l1_core/database/models/orm_models.py`), keeping the domain package free of any database import: `LanguageRepository`, `DeckRepository`, `CardRepository`, `ReviewLogRepository`.
+Each repository converts between domain models and SQLAlchemy ORM models (`l1_core/database/models/orm_models.py`), keeping the domain package free of any database import. `FrequencyRepository` is the one exception — it isn't database-backed at all; it reads static frequency word lists shipped under `l1_core/data/frequency/<code>.txt`.
+
+`WordOccurrenceRepository` is a database-backed counterpart: instead of a shipped static list, it derives word frequency directly from live app data — it counts how many `Card`s use a given word as their `front`, per language, aggregated across every card in the database (no per-user or per-deck scoping). It adds no new table; it's a read-only aggregate query over the existing `cards` table. `count_occurrences(language_code, word)` answers "how many times has this word been added?"; `get_word_counts(language_code)` returns every word ranked by how often it's used, most common first. **Not yet wired into `FrequencyService`** — using it as the deck-generation source directly would be circular on a fresh install (no cards yet to count), so for now it's a standalone building block.
 
 ### Service Layer
 
@@ -90,7 +93,34 @@ Contains the core business logic, kept independent of I/O wherever possible.
 
 * **`SrsService`** — pure SM-2 implementation. Takes a `Card` and a quality grade (0–5), mutates the card's scheduling state, and returns a `ReviewLog`. No I/O, no session — trivial to unit test and to eventually swap for FSRS
 * **`DeckService`** — manual deck/card creation
+* **`FrequencyService`** — generates the next N-card deck from a language's frequency list, advancing `FrequencyProgress` automatically
 * **`ReviewService`** — orchestrates a study session: fetches due cards, delegates grading to `SrsService`, persists the updated card and the new `ReviewLog`
+
+---
+
+## 🧠 Core Concept
+
+The system is designed around **automatic deck generation from frequency data**.
+
+Each language's word list is walked in order of raw frequency rank. `FrequencyService` turns the next unclaimed chunk into a new deck, tracking exactly where it left off via `FrequencyProgress` — so every call continues rather than repeats.
+
+```python
+deck = service.generate_next_deck("en", count=20)
+# -> Deck(name="en-freq-0001-0020", ...), 20 cards created
+# next call for "en" continues from rank 21
+```
+
+---
+
+## ⚠️ Deliberate MVP Scope: No Auto-Translation, No Grammar-Aware Ordering
+
+`FrequencyService` generates cards with the target-language word as `front`, but leaves `back` as a placeholder (`"(translation pending)"`), and orders cards by raw frequency rank only — no part-of-speech awareness. Both are deliberate scope decisions, not oversights: the goal for this stage is a working single-word flashcard loop in daily use as soon as possible. See Roadmap for where translation and grammatical ordering are planned.
+
+---
+
+## 📦 Frequency Data
+
+The lists shipped under `l1_core/data/frequency/` (`en.txt`, `pt.txt`) are **small placeholder samples (50 words each)**, not full lists. For real use, replace them with a complete frequency list in the same one-word-per-line format, ordered from most to least frequent — for example the ones from [hermitdave/FrequencyWords](https://github.com/hermitdave/FrequencyWords).
 
 ---
 
@@ -105,8 +135,9 @@ pytest tests/ -v
 
 | Suite | Covers |
 |---|---|
-| `tests/unit/services/test_srs_service.py` | `SrsService` tested in isolation (no database) — SM-2 progression, lapses, ease-factor floor, and edge cases |
-| `tests/integration/repositories/test_card_repository.py` | `CardRepository` against an in-memory SQLite database — due-card queries, updates |
+| `tests/unit/services/` | `SrsService` tested in isolation (no database) — SM-2 progression, lapses, ease-factor floor, and edge cases |
+| `tests/integration/repositories/` | `CardRepository` against an in-memory SQLite database — due-card queries, updates; `WordOccurrenceRepository` — counting, case-insensitivity, language scoping, ranking |
+| `tests/integration/services/` | `FrequencyService` end-to-end against the shipped sample data — deck naming, rank continuation, exhaustion |
 
 Tests never touch a real `l1.db` file — everything runs against `sqlite:///:memory:` (see `tests/conftest.py`).
 
@@ -118,24 +149,24 @@ Tests never touch a real `l1.db` file — everything runs against `sqlite:///:me
 l1-backend-core/
 ├── l1_core/
 │   ├── domain/
-│   │   └── models/          # Card, Deck, Language, ReviewLog
+│   │   └── models/          # Card, Deck, ReviewLog, Language, FrequencyProgress
 │   ├── database/
 │   │   ├── base.py
 │   │   ├── session.py
 │   │   └── models/
 │   │       └── orm_models.py
 │   ├── repositories/
-│   │   ├── card_repository.py
-│   │   ├── deck_repository.py
-│   │   ├── language_repository.py
-│   │   └── review_log_repository.py
-│   └── services/
-│       ├── srs_service.py
-│       ├── deck_service.py
-│       └── review_service.py
+│   ├── services/
+│   │   ├── srs_service.py
+│   │   ├── deck_service.py
+│   │   ├── frequency_service.py
+│   │   └── review_service.py
+│   └── data/frequency/       # word-frequency lists (sample data)
 ├── tests/
 │   ├── unit/services/
-│   └── integration/repositories/
+│   └── integration/
+│       ├── repositories/
+│       └── services/
 ├── pyproject.toml
 ├── requirements.txt
 ├── .env.example
@@ -144,8 +175,9 @@ l1-backend-core/
 
 * **domain/models** → business entities with encapsulated SM-2 state
 * **database/** → SQLAlchemy setup, including session, base, and ORM models
-* **repositories** → database-backed persistence for each domain model
+* **repositories** → database-backed persistence, plus the static-file-backed `FrequencyRepository` and the live-aggregate `WordOccurrenceRepository`
 * **services** → business logic, kept free of I/O wherever possible (`SrsService`)
+* **data/frequency** → shipped word-frequency sample lists, one file per language
 * **tests/** → unit and integration tests (see Testing section above)
 
 ---
@@ -153,18 +185,17 @@ l1-backend-core/
 ## 🗺 Roadmap
 
 ### ✅ Sprint 1 — Core Domain & SRS
-* Domain models: `Card`, `Deck`, `ReviewLog`, `Language`
+* Domain models: `Card`, `Deck`, `ReviewLog`, `Language`, `FrequencyProgress`
 * SM-2 algorithm implemented in `SrsService`
 * SQLAlchemy persistence layer, repository pattern
-* `DeckService` and `ReviewService` for manual deck/card creation and study sessions
 * Unit tests for SRS logic, integration tests for repositories
 
-### 🔲 Sprint 2 — Frequency-Based Decks
+### ✅ Sprint 2 — Frequency-Based Decks
 * `FrequencyRepository` reading static word lists
-* `FrequencyProgress` domain model + `FrequencyService` auto-generating decks, tracking progress per language
-* Deck naming convention (`<lang>-freq-<start>-<end>`), using the `FREQUENCY` source already reserved on `Card`/`Deck`
-* Sample frequency word lists shipped under `l1_core/data/frequency/`
+* `FrequencyService` auto-generating decks, tracking progress per language
+* Deck naming convention (`<lang>-freq-<start>-<end>`)
 * Integration tests covering deck naming, rank continuation, and list exhaustion
+* `WordOccurrenceRepository` — live, community-driven word counts derived from `Card` data, as a standalone alternative to the static frequency list (not yet wired into `FrequencyService`)
 
 ### 🔲 Sprint 3 — Translation
 * Bundle or integrate a bilingual dictionary / translation API to fill `Card.back` automatically instead of leaving a placeholder

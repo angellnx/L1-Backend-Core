@@ -92,3 +92,16 @@ class ReviewLogORM(Base):
     reaction_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     card: Mapped["CardORM"] = relationship(back_populates="review_logs")
+
+
+class FrequencyProgressORM(Base):
+    """ORM model for FrequencyProgress persistence.
+
+    One row per language, tracking the last frequency rank already
+    turned into a deck.
+    """
+
+    __tablename__ = "frequency_progress"
+
+    language_code: Mapped[str] = mapped_column(String(5), primary_key=True)
+    last_rank_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
